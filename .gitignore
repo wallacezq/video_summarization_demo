@@ -1,0 +1,6 @@
+.git
+__pycache__
+*.pt
+output/*
+video_chunks/*
+rtsp_live_chunks/*
