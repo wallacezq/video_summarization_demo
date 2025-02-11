@@ -1,5 +1,4 @@
 import torch
-
 from langchain_core.outputs import GenerationChunk
 from langchain.llms.base import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
@@ -8,8 +7,32 @@ from decord import VideoReader, cpu
 from pydantic import Field
 from typing import List, Optional, Sequence, Any, Iterator, Dict
 from PIL import Image
+import cv2
+import numpy as np
 
 MAX_NUM_FRAMES=8
+
+def encode_video_vllava(
+        video_path,
+        clip_start_sec=0.0,
+        clip_end_sec=None,
+        num_frames=8):
+    
+    cv2_vr = cv2.VideoCapture(video_path)
+    duration = int(cv2_vr.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_id_list = np.linspace(0, duration-1, num_frames, dtype=int)
+    frames=[]
+    
+    #print(f"frame_id_list: {frame_id_list}")
+
+    video_data = []
+    for frame_idx in frame_id_list:
+        cv2_vr.set(1, frame_idx)
+        _, frame = cv2_vr.read()
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame)
+    cv2_vr.release()
+    return np.stack(frames)
 
 def encode_video(video_path):
     def uniform_sample(l, n):
@@ -30,7 +53,7 @@ def encode_video(video_path):
 class MiniCPMV26Wrapper(LLM):
     model: object 
     tokenizer: object
-    max_token_length: int = Field(default=128)
+    max_token_length: Optional[int] = 128
 
     @property
     def _llm_type(self) -> str:
@@ -74,6 +97,75 @@ class MiniCPMV26Wrapper(LLM):
              torch.xpu.synchronize()
         
         return response
+        
+        
+class VideoLLaVAWrapper(LLM):
+    model: Optional[object] = None 
+    processor: Optional[object] = None
+    device: Optional[str] = 'cpu'
+    max_token_length: Optional[int] = 128
+    prompt_length:  Optional[int]   = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "Custom Video Llava LVM"
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,       
+    ) -> str:
+
+        # Set decode params for video. TO DO. Make class attributes
+        params={}
+        inputs=None
+
+        # Format prompt for "model.chat()"
+        splitted_prompt = prompt.split('$$$$')
+        
+        frames = None
+        
+        if len(splitted_prompt) == 2:
+           video_fh, question = splitted_prompt
+           frames = encode_video_vllava(video_fh)
+        else:
+           question = splitted_prompt 
+        
+        # format the prompt for vllava
+        if len(splitted_prompt) == 2:
+          question = f"<video>\n{question}"
+        # TODO: Add image support
+        #if image is not None:
+        #   prompt_text = "<image>\n" + prompt_text       
+        question = f"USER: {question} ASSISTANT:"        
+        
+        
+        with torch.inference_mode():
+          inputs = self.processor(text=question, videos=frames, padding=True, return_tensors="pt")
+          
+          self.prompt_length=inputs['input_ids'].shape[1]
+          
+          #print(f"prompt_length: {self.prompt_length}")
+          
+          # Move inputs to the XPU
+          inputs = {k: v.to(self.device) for k, v in inputs.items()}    
+          
+          # Chat
+          generate_ids = self.model.generate(
+              **inputs,
+              max_length=self.max_token_length,
+          )
+        
+          if 'xpu' in self.device and torch.xpu.is_available():
+             torch.xpu.synchronize()
+             
+          #print(f"generate_ids: {generate_ids}\nlen(generate_ids): {len(generate_ids)}")
+          #generate_ids = generate_ids.cpu()
+          
+          result = self.processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+          #result = self.processor.decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        
+        return result        
         
 class Llama32Wrapper(LLM):
     model: object 
